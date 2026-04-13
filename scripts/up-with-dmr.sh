@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL_REF="${1:-hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q6_K}"
+MODEL_REF="${1:-hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K}"
 
 cd "${ROOT_DIR}"
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_REF="${1:-hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q6_K}"
+MODEL_REF="${1:-hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K}"
 HF_TOKEN_FILE="${HF_TOKEN_FILE:-${HOME}/.cache/huggingface/token}"
-LOW_MEM_MODEL_REF="${LOW_MEM_MODEL_REF:-hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M}"
+LOW_MEM_MODEL_REF="${LOW_MEM_MODEL_REF:-hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K}"
 AUTO_FALLBACK_LOW_MEM="${AUTO_FALLBACK_LOW_MEM:-1}"
 UNLOAD_EXISTING_MODELS="${UNLOAD_EXISTING_MODELS:-1}"
 ENV_FILE="${ENV_FILE:-.env}"
