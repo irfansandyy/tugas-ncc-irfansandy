@@ -33,8 +33,13 @@ func (h *HealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
+	payload := map[string]any{
+		"status":   result.Status,
 		"services": result.Services,
-	})
+	}
+	if len(result.Errors) > 0 {
+		payload["errors"] = result.Errors
+	}
+
+	writeJSON(w, http.StatusOK, payload)
 }
