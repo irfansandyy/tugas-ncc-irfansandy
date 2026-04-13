@@ -218,7 +218,7 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
             <h1 className="chat-title">{activeChatId ? `Chat #${activeChatId}` : "Start a conversation"}</h1>
             <small className="muted">{userEmail || "Authenticated user"}</small>
           </div>
-          <button className="button button-ghost" type="button" onClick={logout}>
+          <button className="button button-ghost chat-logout" type="button" onClick={logout}>
             Logout
           </button>
         </header>

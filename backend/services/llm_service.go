@@ -74,6 +74,37 @@ type chatCompletionResponse struct {
 	} `json:"choices"`
 }
 
+func (s *LLMService) apiBaseCandidates() []string {
+	base := strings.TrimSuffix(s.baseURL, "/")
+	candidates := []string{base}
+
+	if strings.HasSuffix(base, "/engines") {
+		candidates = append(candidates, strings.TrimSuffix(base, "/engines"))
+	} else if !strings.HasSuffix(base, "/v1") && !strings.HasSuffix(base, "/engines/v1") {
+		candidates = append(candidates, base+"/engines")
+	}
+
+	seen := map[string]bool{}
+	unique := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		unique = append(unique, item)
+	}
+
+	return unique
+}
+
+func toOpenAIEndpoint(apiBase, suffix string) string {
+	if strings.HasSuffix(apiBase, "/v1") || strings.HasSuffix(apiBase, "/engines/v1") {
+		return apiBase + suffix
+	}
+
+	return apiBase + "/v1" + suffix
+}
+
 func (s *LLMService) GenerateReply(ctx context.Context, history []models.Message, userPrompt string) (string, error) {
 	requestMessages := []chatMessage{
 		{
@@ -118,34 +149,51 @@ func (s *LLMService) GenerateReply(ctx context.Context, history []models.Message
 		return "", err
 	}
 
-	endpoint := s.baseURL + "/v1/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	var lastErr error
+	for _, apiBase := range s.apiBaseCandidates() {
+		endpoint := toOpenAIEndpoint(apiBase, "/chat/completions")
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if reqErr != nil {
+			lastErr = reqErr
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+		resp, doErr := s.client.Do(req)
+		if doErr != nil {
+			lastErr = fmt.Errorf("llm request failed via %s: %w", endpoint, doErr)
+			continue
+		}
 
-	if resp.StatusCode >= http.StatusBadRequest {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("llm request failed: status=%d body=%s", resp.StatusCode, string(respBody))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			lastErr = fmt.Errorf("llm endpoint not found at %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+			continue
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			return "", fmt.Errorf("llm request failed via %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+		}
+
+		var completion chatCompletionResponse
+		if decodeErr := json.Unmarshal(respBody, &completion); decodeErr != nil {
+			return "", decodeErr
+		}
+
+		if len(completion.Choices) == 0 {
+			return "", errors.New("llm returned no choices")
+		}
+
+		return strings.TrimSpace(completion.Choices[0].Message.Content), nil
 	}
 
-	var completion chatCompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&completion); err != nil {
-		return "", err
+	if lastErr != nil {
+		return "", lastErr
 	}
 
-	if len(completion.Choices) == 0 {
-		return "", errors.New("llm returned no choices")
-	}
-
-	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+	return "", errors.New("llm request failed: no reachable endpoint")
 }
 
 func limitMessagesByContext(messages []chatMessage, ctxSize int) []chatMessage {
@@ -196,35 +244,52 @@ func estimateTokens(content string) int {
 }
 
 func (s *LLMService) HealthCheck(ctx context.Context) error {
-	healthURL := s.baseURL + "/health"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-	if err == nil {
+	for _, apiBase := range s.apiBaseCandidates() {
+		healthURL := apiBase + "/health"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			continue
+		}
+
 		resp, reqErr := s.client.Do(req)
-		if reqErr == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
+		if reqErr != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return nil
 		}
 	}
 
 	fallbackCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	modelsURL := s.baseURL + "/v1/models"
-	modelsReq, err := http.NewRequestWithContext(fallbackCtx, http.MethodGet, modelsURL, nil)
-	if err != nil {
-		return err
+
+	var lastErr error
+	for _, apiBase := range s.apiBaseCandidates() {
+		modelsURL := toOpenAIEndpoint(apiBase, "/models")
+		modelsReq, err := http.NewRequestWithContext(fallbackCtx, http.MethodGet, modelsURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		resp, reqErr := s.client.Do(modelsReq)
+		if reqErr != nil {
+			lastErr = fmt.Errorf("llm health request failed via %s: %w", modelsURL, reqErr)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+
+		lastErr = fmt.Errorf("llm health failed via %s with status %d", modelsURL, resp.StatusCode)
 	}
 
-	resp, err := s.client.Do(modelsReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("llm health failed with status %d", resp.StatusCode)
+	if lastErr != nil {
+		return lastErr
 	}
 
-	return nil
+	return errors.New("llm health failed: no reachable endpoint")
 }

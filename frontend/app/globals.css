@@ -181,6 +181,12 @@ a {
   font-size: 1.1rem;
 }
 
+.chat-logout {
+  width: auto;
+  min-width: 110px;
+  padding: 8px 16px;
+}
+
 .chat-messages {
   padding: 18px;
   overflow: auto;
