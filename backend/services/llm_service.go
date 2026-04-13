@@ -539,6 +539,110 @@ func consumeChatCompletionStream(body io.Reader, onToken func(string) error) (st
 	return builder.String(), nil
 }
 
+func (s *LLMService) GenerateTitle(ctx context.Context, firstPrompt string) (string, error) {
+	titlePrompt := strings.TrimSpace(firstPrompt)
+	if titlePrompt == "" {
+		return "", errors.New("title prompt is empty")
+	}
+
+	messages := []chatMessage{
+		{
+			Role: "system",
+			Content: "You are a chat title generator. Return ONLY a concise title with 3-7 words. " +
+				"No quotes. No punctuation at the end.",
+		},
+		{
+			Role:    "user",
+			Content: titlePrompt,
+		},
+	}
+
+	payload := chatCompletionRequest{
+		Model:       s.model,
+		Messages:    messages,
+		Temperature: 0.2,
+		Stream:      false,
+		MaxTokens:   24,
+		TopP:        0.9,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for _, apiBase := range s.apiBaseCandidates() {
+		for _, endpoint := range openAIEndpointCandidates(apiBase, "/chat/completions") {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if reqErr != nil {
+				lastErr = reqErr
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, doErr := s.client.Do(req)
+			if doErr != nil {
+				lastErr = doErr
+				continue
+			}
+
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+
+			if resp.StatusCode >= http.StatusBadRequest {
+				lastErr = fmt.Errorf("title generation failed via %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+				continue
+			}
+
+			var completion chatCompletionResponse
+			if decodeErr := json.Unmarshal(respBody, &completion); decodeErr != nil {
+				lastErr = decodeErr
+				continue
+			}
+
+			if len(completion.Choices) == 0 {
+				lastErr = errors.New("title generation returned no choices")
+				continue
+			}
+
+			title := strings.TrimSpace(completion.Choices[0].Message.Content)
+			title = strings.Trim(title, "\"' ")
+			title = strings.Join(strings.Fields(title), " ")
+			if title == "" {
+				lastErr = errors.New("title generation returned empty text")
+				continue
+			}
+
+			if len([]rune(title)) > 72 {
+				title = string([]rune(title)[:72])
+			}
+
+			return title, nil
+		}
+	}
+
+	if lastErr != nil {
+		fallbackPrompt := "System: Generate a 3-7 word title\nUser: " + titlePrompt + "\nAssistant:"
+		fallback, fallbackErr := s.tryCompletionFallback(ctx, fallbackPrompt, 24)
+		if fallbackErr != nil {
+			return "", fmt.Errorf("%v; title fallback error: %w", lastErr, fallbackErr)
+		}
+
+		fallback = strings.TrimSpace(strings.Trim(fallback, "\"' "))
+		fallback = strings.Join(strings.Fields(fallback), " ")
+		if fallback == "" {
+			return "", errors.New("title fallback returned empty text")
+		}
+		if len([]rune(fallback)) > 72 {
+			fallback = string([]rune(fallback)[:72])
+		}
+		return fallback, nil
+	}
+
+	return "", errors.New("title generation failed")
+}
+
 func limitMessagesByContext(messages []chatMessage, ctxSize int) []chatMessage {
 	if len(messages) <= 1 || ctxSize <= 0 {
 		return messages

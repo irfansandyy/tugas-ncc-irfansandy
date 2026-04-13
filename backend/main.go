@@ -82,9 +82,9 @@ func main() {
 			protected.Use(middleware.JWTAuth(authService))
 			protected.Get("/chats", chatHandler.ListChats)
 			protected.Post("/chats", chatHandler.CreateChat)
-			protected.Get("/chats/{chatID}/messages", chatHandler.ListMessages)
-			protected.Post("/chats/{chatID}/messages", chatHandler.SendMessage)
-			protected.Post("/chats/{chatID}/messages/stream", chatHandler.SendMessageStream)
+			protected.Get("/chats/{chatSlug}/messages", chatHandler.ListMessages)
+			protected.Post("/chats/{chatSlug}/messages", chatHandler.SendMessage)
+			protected.Post("/chats/{chatSlug}/messages/stream", chatHandler.SendMessageStream)
 		})
 	})
 

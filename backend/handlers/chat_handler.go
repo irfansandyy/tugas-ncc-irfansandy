@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
+	"strings"
 
 	"app-backend/middleware"
 	"app-backend/repositories"
@@ -78,7 +78,7 @@ func (h *ChatHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatID, err := parseChatID(r)
+	chatID, err := parseChatSlug(r)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid chat id")
 		return
@@ -104,7 +104,7 @@ func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatID, err := parseChatID(r)
+	chatID, err := parseChatSlug(r)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid chat id")
 		return
@@ -139,7 +139,7 @@ func (h *ChatHandler) SendMessageStream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	chatID, err := parseChatID(r)
+	chatID, err := parseChatSlug(r)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid chat id")
 		return
@@ -197,7 +197,12 @@ func (h *ChatHandler) SendMessageStream(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func parseChatID(r *http.Request) (int64, error) {
-	chatIDRaw := chi.URLParam(r, "chatID")
-	return strconv.ParseInt(chatIDRaw, 10, 64)
+func parseChatSlug(r *http.Request) (string, error) {
+	chatSlug := chi.URLParam(r, "chatSlug")
+	chatSlug = strings.TrimSpace(chatSlug)
+	if chatSlug == "" {
+		return "", errors.New("missing chat slug")
+	}
+
+	return chatSlug, nil
 }

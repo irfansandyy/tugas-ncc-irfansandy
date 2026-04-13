@@ -6,14 +6,13 @@ type ChatPageProps = {
         chatId: string;
       }
     | Promise<{
-    chatId: string;
+        chatId: string;
       }>;
 };
 
 export default async function ChatPage({ params }: ChatPageProps) {
   const resolvedParams = await Promise.resolve(params);
-  const parsed = Number(resolvedParams.chatId);
-  const chatId = Number.isFinite(parsed) ? parsed : undefined;
+  const chatSlug = resolvedParams.chatId?.trim() || undefined;
 
-  return <ChatShell activeChatId={chatId} />;
+  return <ChatShell activeChatSlug={chatSlug} />;
 }

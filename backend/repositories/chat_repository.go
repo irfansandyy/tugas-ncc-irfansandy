@@ -2,7 +2,9 @@ package repositories
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"strings"
 
@@ -17,6 +19,8 @@ type ChatRepository interface {
 	CreateChat(ctx context.Context, userID int64, title string) (models.Chat, error)
 	ListChatsByUser(ctx context.Context, userID int64) ([]models.Chat, error)
 	GetChatByID(ctx context.Context, chatID, userID int64) (models.Chat, error)
+	GetChatBySlug(ctx context.Context, slug string, userID int64) (models.Chat, error)
+	UpdateChatTitle(ctx context.Context, chatID, userID int64, title string) (models.Chat, error)
 	CreateMessage(ctx context.Context, chatID int64, role, content string) (models.Message, error)
 	ListMessagesByChat(ctx context.Context, chatID, userID int64, limit int) ([]models.Message, error)
 	UpdateChatTimestamp(ctx context.Context, chatID int64) error
@@ -30,15 +34,34 @@ func NewPostgresChatRepository(db *sql.DB) *PostgresChatRepository {
 	return &PostgresChatRepository{db: db}
 }
 
+func generateChatSlug() (string, error) {
+	parts := []int{4, 2, 2, 2, 6}
+	chunks := make([]string, len(parts))
+	for i, byteLen := range parts {
+		buf := make([]byte, byteLen)
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		chunks[i] = hex.EncodeToString(buf)
+	}
+
+	return strings.Join(chunks, "-"), nil
+}
+
 func (r *PostgresChatRepository) CreateChat(ctx context.Context, userID int64, title string) (models.Chat, error) {
+	slug, err := generateChatSlug()
+	if err != nil {
+		return models.Chat{}, err
+	}
+
 	query := `
-		INSERT INTO chats (user_id, title)
-		VALUES ($1, $2)
-		RETURNING id, user_id, title, created_at, updated_at`
+		INSERT INTO chats (user_id, title, slug)
+		VALUES ($1, $2, $3)
+		RETURNING id, user_id, title, COALESCE(slug, ''), created_at, updated_at`
 
 	var chat models.Chat
-	err := r.db.QueryRowContext(ctx, query, userID, title).
-		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.CreatedAt, &chat.UpdatedAt)
+	err = r.db.QueryRowContext(ctx, query, userID, title, slug).
+		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.Slug, &chat.CreatedAt, &chat.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" && strings.Contains(pgErr.ConstraintName, "chats_user_id_fkey") {
@@ -52,7 +75,7 @@ func (r *PostgresChatRepository) CreateChat(ctx context.Context, userID int64, t
 
 func (r *PostgresChatRepository) ListChatsByUser(ctx context.Context, userID int64) ([]models.Chat, error) {
 	query := `
-		SELECT id, user_id, title, created_at, updated_at
+		SELECT id, user_id, title, COALESCE(slug, 'chat-' || id::text), created_at, updated_at
 		FROM chats
 		WHERE user_id = $1
 		ORDER BY updated_at DESC`
@@ -66,7 +89,7 @@ func (r *PostgresChatRepository) ListChatsByUser(ctx context.Context, userID int
 	chats := make([]models.Chat, 0)
 	for rows.Next() {
 		var chat models.Chat
-		if err := rows.Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.CreatedAt, &chat.UpdatedAt); err != nil {
+		if err := rows.Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.Slug, &chat.CreatedAt, &chat.UpdatedAt); err != nil {
 			return nil, err
 		}
 		chats = append(chats, chat)
@@ -81,13 +104,52 @@ func (r *PostgresChatRepository) ListChatsByUser(ctx context.Context, userID int
 
 func (r *PostgresChatRepository) GetChatByID(ctx context.Context, chatID, userID int64) (models.Chat, error) {
 	query := `
-		SELECT id, user_id, title, created_at, updated_at
+		SELECT id, user_id, title, COALESCE(slug, 'chat-' || id::text), created_at, updated_at
 		FROM chats
 		WHERE id = $1 AND user_id = $2`
 
 	var chat models.Chat
 	err := r.db.QueryRowContext(ctx, query, chatID, userID).
-		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.CreatedAt, &chat.UpdatedAt)
+		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.Slug, &chat.CreatedAt, &chat.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.Chat{}, ErrChatNotFound
+		}
+		return models.Chat{}, err
+	}
+
+	return chat, nil
+}
+
+func (r *PostgresChatRepository) GetChatBySlug(ctx context.Context, slug string, userID int64) (models.Chat, error) {
+	query := `
+		SELECT id, user_id, title, COALESCE(slug, 'chat-' || id::text), created_at, updated_at
+		FROM chats
+		WHERE COALESCE(slug, 'chat-' || id::text) = $1 AND user_id = $2`
+
+	var chat models.Chat
+	err := r.db.QueryRowContext(ctx, query, slug, userID).
+		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.Slug, &chat.CreatedAt, &chat.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.Chat{}, ErrChatNotFound
+		}
+		return models.Chat{}, err
+	}
+
+	return chat, nil
+}
+
+func (r *PostgresChatRepository) UpdateChatTitle(ctx context.Context, chatID, userID int64, title string) (models.Chat, error) {
+	query := `
+		UPDATE chats
+		SET title = $1, updated_at = NOW()
+		WHERE id = $2 AND user_id = $3
+		RETURNING id, user_id, title, COALESCE(slug, 'chat-' || id::text), created_at, updated_at`
+
+	var chat models.Chat
+	err := r.db.QueryRowContext(ctx, query, title, chatID, userID).
+		Scan(&chat.ID, &chat.UserID, &chat.Title, &chat.Slug, &chat.CreatedAt, &chat.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return models.Chat{}, ErrChatNotFound

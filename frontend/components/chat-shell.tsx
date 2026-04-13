@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE_URL, APIError, apiFetch } from "@/lib/api";
 import { clearSession, getEmail, getToken } from "@/lib/auth";
 
 type Chat = {
   id: number;
+  slug: string;
   title: string;
   updated_at: string;
 };
@@ -20,7 +21,7 @@ type Message = {
 };
 
 type ChatShellProps = {
-  activeChatId?: number;
+  activeChatSlug?: string;
 };
 
 type ChatsResponse = {
@@ -36,33 +37,75 @@ type SendMessageResponse = {
   assistant_message: Message;
 };
 
-export default function ChatShell({ activeChatId }: ChatShellProps) {
+const chatsCache: {
+  items: Chat[];
+} = {
+  items: []
+};
+
+const messagesCache: Record<string, Message[]> = {};
+
+function formatUpdatedAt(updatedAt: string): string {
+  const date = new Date(updatedAt);
+  if (Number.isNaN(date.getTime())) {
+    return "Updated recently";
+  }
+
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+export default function ChatShell({ activeChatSlug }: ChatShellProps) {
   const router = useRouter();
   const [chats, setChats] = useState<Chat[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [loadingChats, setLoadingChats] = useState(true);
+  const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string>("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const messagesBottomRef = useRef<HTMLDivElement | null>(null);
 
   const token = useMemo(() => getToken(), []);
+  const activeChat = useMemo(
+    () => chats.find((chat) => chat.slug === activeChatSlug),
+    [activeChatSlug, chats]
+  );
+  const profileName = useMemo(() => {
+    if (!userEmail) {
+      return "User";
+    }
+    return userEmail.split("@")[0] || userEmail;
+  }, [userEmail]);
+  const avatar = useMemo(() => {
+    return profileName.slice(0, 2).toUpperCase();
+  }, [profileName]);
 
   const handleUnauthorized = useCallback(() => {
     clearSession();
     router.replace("/login");
   }, [router]);
 
-  const loadChats = useCallback(async () => {
+  const loadChats = useCallback(async (showLoader = true) => {
     if (!token) {
       handleUnauthorized();
       return;
     }
 
-    setLoadingChats(true);
+    if (showLoader) {
+      setLoadingChats(true);
+    }
     try {
       const response = await apiFetch<ChatsResponse>("/api/chats", { method: "GET" }, token);
       setChats(response.items);
+      chatsCache.items = response.items;
     } catch (err) {
       const apiError = err as APIError;
       if (apiError.status === 401) {
@@ -76,19 +119,26 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
   }, [handleUnauthorized, token]);
 
   const loadMessages = useCallback(
-    async (chatId: number) => {
+    async (chatSlug: string) => {
       if (!token) {
         handleUnauthorized();
         return;
       }
 
+      const cachedMessages = messagesCache[chatSlug];
+      if (cachedMessages) {
+        setMessages(cachedMessages);
+      }
+      setLoadingMessages(true);
+
       try {
         const response = await apiFetch<MessagesResponse>(
-          `/api/chats/${chatId}/messages`,
+          `/api/chats/${chatSlug}/messages`,
           { method: "GET" },
           token
         );
         setMessages(response.items);
+        messagesCache[chatSlug] = response.items;
       } catch (err) {
         const apiError = err as APIError;
         if (apiError.status === 401) {
@@ -96,6 +146,8 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
           return;
         }
         setError(apiError.message);
+      } finally {
+        setLoadingMessages(false);
       }
     },
     [handleUnauthorized, token]
@@ -107,16 +159,39 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
       return;
     }
     setUserEmail(getEmail() ?? "");
-    void loadChats();
+    if (chatsCache.items.length > 0) {
+      setChats(chatsCache.items);
+      setLoadingChats(false);
+      void loadChats(false);
+      return;
+    }
+    void loadChats(true);
   }, [handleUnauthorized, loadChats, token]);
 
   useEffect(() => {
-    if (!activeChatId) {
+    if (!activeChatSlug) {
       setMessages([]);
       return;
     }
-    void loadMessages(activeChatId);
-  }, [activeChatId, loadMessages]);
+    void loadMessages(activeChatSlug);
+  }, [activeChatSlug, loadMessages]);
+
+  useEffect(() => {
+    const onMouseDown = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", onMouseDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    messagesBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   async function createChat(title: string): Promise<Chat> {
     const response = await apiFetch<Chat>(
@@ -127,12 +202,16 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
       },
       token
     );
-    setChats((prev) => [response, ...prev]);
+    setChats((prev) => {
+      const next = [response, ...prev.filter((chat) => chat.slug !== response.slug)];
+      chatsCache.items = next;
+      return next;
+    });
     return response;
   }
 
   async function streamMessage(
-    chatId: number,
+    chatSlug: string,
     content: string,
     onDelta: (delta: string) => void
   ): Promise<SendMessageResponse> {
@@ -140,7 +219,7 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
       throw new APIError("missing token", 401);
     }
 
-    const response = await fetch(`${API_BASE_URL}/api/chats/${chatId}/messages/stream`, {
+    const response = await fetch(`${API_BASE_URL}/api/chats/${chatSlug}/messages/stream`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -256,7 +335,7 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
     setError(null);
     try {
       const chat = await createChat("New Chat");
-      router.push(`/chat/${chat.id}`);
+      router.push(`/chat/${chat.slug}`);
     } catch (err) {
       const apiError = err as APIError;
       if (apiError.status === 401) {
@@ -288,15 +367,15 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
     ]);
 
     try {
-      let chatId = activeChatId;
-      if (!chatId) {
+      let chatSlug = activeChatSlug;
+      if (!chatSlug) {
         const created = await createChat(prompt.slice(0, 42));
-        chatId = created.id;
-        router.push(`/chat/${chatId}`);
+        chatSlug = created.slug;
+        router.push(`/chat/${chatSlug}`);
       }
 
       let streamedText = "";
-      const response = await streamMessage(chatId, prompt, (delta) => {
+      const response = await streamMessage(chatSlug, prompt, (delta) => {
         streamedText += delta;
         setMessages((prev) =>
           prev.map((msg) =>
@@ -309,9 +388,13 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
         const withoutOptimistic = prev.filter(
           (msg) => msg.id !== optimisticUserId && msg.id !== optimisticAssistantId
         );
-        return [...withoutOptimistic, response.user_message, response.assistant_message];
+        const finalized = [...withoutOptimistic, response.user_message, response.assistant_message];
+        if (chatSlug) {
+          messagesCache[chatSlug] = finalized;
+        }
+        return finalized;
       });
-      await loadChats();
+      await loadChats(false);
     } catch (err) {
       const apiError = err as APIError;
       if (apiError.status === 401) {
@@ -328,6 +411,7 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
   }
 
   function logout() {
+    setMenuOpen(false);
     clearSession();
     router.replace("/login");
   }
@@ -344,8 +428,15 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
           {loadingChats ? <li className="muted">Loading chats...</li> : null}
           {!loadingChats && chats.length === 0 ? <li className="muted">No chat history yet.</li> : null}
           {chats.map((chat) => (
-            <li key={chat.id} className={`chat-list-item ${activeChatId === chat.id ? "active" : ""}`}>
-              <Link href={`/chat/${chat.id}`}>{chat.title}</Link>
+            <li key={chat.slug}>
+              <Link
+                href={`/chat/${chat.slug}`}
+                prefetch
+                className={`chat-list-item ${activeChatSlug === chat.slug ? "active" : ""}`}
+              >
+                <span className="chat-list-title">{chat.title}</span>
+                <span className="chat-list-meta">{formatUpdatedAt(chat.updated_at)}</span>
+              </Link>
             </li>
           ))}
         </ul>
@@ -354,22 +445,43 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
       <main className="chat-main">
         <header className="chat-header">
           <div>
-            <h1 className="chat-title">{activeChatId ? `Chat #${activeChatId}` : "Start a conversation"}</h1>
+            <h1 className="chat-title">{activeChat ? activeChat.title : "Start a conversation"}</h1>
             <small className="muted">{userEmail || "Authenticated user"}</small>
           </div>
-          <button className="button button-ghost chat-logout" type="button" onClick={logout}>
-            Logout
-          </button>
+          <div className="profile-menu" ref={menuRef}>
+            <button
+              className="profile-trigger"
+              type="button"
+              aria-expanded={menuOpen}
+              aria-haspopup="menu"
+              onClick={() => setMenuOpen((prev) => !prev)}
+            >
+              <span className="profile-avatar">{avatar}</span>
+              <span className="profile-name">{profileName}</span>
+            </button>
+            {menuOpen ? (
+              <div className="profile-dropdown" role="menu">
+                <p className="profile-email">{userEmail || "No email found"}</p>
+                <button className="button button-ghost chat-logout" type="button" onClick={logout}>
+                  Logout
+                </button>
+              </div>
+            ) : null}
+          </div>
         </header>
 
         <section className="chat-messages">
-          {!activeChatId ? <p className="muted">Select a chat from the sidebar or create a new one.</p> : null}
-          {activeChatId && messages.length === 0 ? <p className="muted">No messages yet. Send the first prompt.</p> : null}
+          {!activeChatSlug ? <p className="muted">Select a chat from the sidebar or create a new one.</p> : null}
+          {activeChatSlug && loadingMessages ? <p className="muted">Loading messages...</p> : null}
+          {activeChatSlug && !loadingMessages && messages.length === 0 ? (
+            <p className="muted">No messages yet. Send the first prompt.</p>
+          ) : null}
           {messages.map((msg) => (
             <article key={msg.id} className={`message ${msg.role}`}>
               {msg.content}
             </article>
           ))}
+          <div ref={messagesBottomRef} />
         </section>
 
         <form className="chat-composer" onSubmit={handleSendMessage}>

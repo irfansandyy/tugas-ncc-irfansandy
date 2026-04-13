@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"app-backend/models"
 	"app-backend/repositories"
@@ -30,26 +31,37 @@ func (s *ChatService) ListChats(ctx context.Context, userID int64) ([]models.Cha
 	return s.chatRepo.ListChatsByUser(ctx, userID)
 }
 
-func (s *ChatService) ListMessages(ctx context.Context, userID, chatID int64) ([]models.Message, error) {
-	return s.chatRepo.ListMessagesByChat(ctx, chatID, userID, 0)
+func (s *ChatService) ListMessages(ctx context.Context, userID int64, chatSlug string) ([]models.Message, error) {
+	chat, err := s.chatRepo.GetChatBySlug(ctx, chatSlug, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.chatRepo.ListMessagesByChat(ctx, chat.ID, userID, 0)
 }
 
-func (s *ChatService) SendMessage(ctx context.Context, userID, chatID int64, content string) (models.Message, models.Message, error) {
+func (s *ChatService) SendMessage(ctx context.Context, userID int64, chatSlug, content string) (models.Message, models.Message, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return models.Message{}, models.Message{}, fmt.Errorf("message content is required")
 	}
 
-	if _, err := s.chatRepo.GetChatByID(ctx, chatID, userID); err != nil {
-		return models.Message{}, models.Message{}, err
-	}
-
-	userMessage, err := s.chatRepo.CreateMessage(ctx, chatID, "user", content)
+	chat, err := s.chatRepo.GetChatBySlug(ctx, chatSlug, userID)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
 
-	history, err := s.chatRepo.ListMessagesByChat(ctx, chatID, userID, 20)
+	hadMessages := false
+	if existing, listErr := s.chatRepo.ListMessagesByChat(ctx, chat.ID, userID, 1); listErr == nil && len(existing) > 0 {
+		hadMessages = true
+	}
+
+	userMessage, err := s.chatRepo.CreateMessage(ctx, chat.ID, "user", content)
+	if err != nil {
+		return models.Message{}, models.Message{}, err
+	}
+
+	history, err := s.chatRepo.ListMessagesByChat(ctx, chat.ID, userID, 20)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
@@ -59,13 +71,22 @@ func (s *ChatService) SendMessage(ctx context.Context, userID, chatID int64, con
 		return models.Message{}, models.Message{}, err
 	}
 
-	assistantMessage, err := s.chatRepo.CreateMessage(ctx, chatID, "assistant", reply)
+	assistantMessage, err := s.chatRepo.CreateMessage(ctx, chat.ID, "assistant", reply)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
 
-	if err := s.chatRepo.UpdateChatTimestamp(ctx, chatID); err != nil {
+	if err := s.chatRepo.UpdateChatTimestamp(ctx, chat.ID); err != nil {
 		return models.Message{}, models.Message{}, err
+	}
+
+	if !hadMessages {
+		titleCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		title, titleErr := s.llm.GenerateTitle(titleCtx, content)
+		cancel()
+		if titleErr == nil && strings.TrimSpace(title) != "" {
+			_, _ = s.chatRepo.UpdateChatTitle(ctx, chat.ID, userID, strings.TrimSpace(title))
+		}
 	}
 
 	return userMessage, assistantMessage, nil
@@ -73,7 +94,8 @@ func (s *ChatService) SendMessage(ctx context.Context, userID, chatID int64, con
 
 func (s *ChatService) SendMessageStream(
 	ctx context.Context,
-	userID, chatID int64,
+	userID int64,
+	chatSlug string,
 	content string,
 	onToken func(string) error,
 ) (models.Message, models.Message, error) {
@@ -82,16 +104,22 @@ func (s *ChatService) SendMessageStream(
 		return models.Message{}, models.Message{}, fmt.Errorf("message content is required")
 	}
 
-	if _, err := s.chatRepo.GetChatByID(ctx, chatID, userID); err != nil {
-		return models.Message{}, models.Message{}, err
-	}
-
-	userMessage, err := s.chatRepo.CreateMessage(ctx, chatID, "user", content)
+	chat, err := s.chatRepo.GetChatBySlug(ctx, chatSlug, userID)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
 
-	history, err := s.chatRepo.ListMessagesByChat(ctx, chatID, userID, 20)
+	hadMessages := false
+	if existing, listErr := s.chatRepo.ListMessagesByChat(ctx, chat.ID, userID, 1); listErr == nil && len(existing) > 0 {
+		hadMessages = true
+	}
+
+	userMessage, err := s.chatRepo.CreateMessage(ctx, chat.ID, "user", content)
+	if err != nil {
+		return models.Message{}, models.Message{}, err
+	}
+
+	history, err := s.chatRepo.ListMessagesByChat(ctx, chat.ID, userID, 20)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
@@ -101,13 +129,22 @@ func (s *ChatService) SendMessageStream(
 		return models.Message{}, models.Message{}, err
 	}
 
-	assistantMessage, err := s.chatRepo.CreateMessage(ctx, chatID, "assistant", reply)
+	assistantMessage, err := s.chatRepo.CreateMessage(ctx, chat.ID, "assistant", reply)
 	if err != nil {
 		return models.Message{}, models.Message{}, err
 	}
 
-	if err := s.chatRepo.UpdateChatTimestamp(ctx, chatID); err != nil {
+	if err := s.chatRepo.UpdateChatTimestamp(ctx, chat.ID); err != nil {
 		return models.Message{}, models.Message{}, err
+	}
+
+	if !hadMessages {
+		titleCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		title, titleErr := s.llm.GenerateTitle(titleCtx, content)
+		cancel()
+		if titleErr == nil && strings.TrimSpace(title) != "" {
+			_, _ = s.chatRepo.UpdateChatTitle(ctx, chat.ID, userID, strings.TrimSpace(title))
+		}
 	}
 
 	return userMessage, assistantMessage, nil
