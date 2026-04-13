@@ -84,6 +84,7 @@ func main() {
 			protected.Post("/chats", chatHandler.CreateChat)
 			protected.Get("/chats/{chatID}/messages", chatHandler.ListMessages)
 			protected.Post("/chats/{chatID}/messages", chatHandler.SendMessage)
+			protected.Post("/chats/{chatID}/messages/stream", chatHandler.SendMessageStream)
 		})
 	})
 

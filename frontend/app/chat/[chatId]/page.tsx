@@ -1,13 +1,18 @@
 import ChatShell from "@/components/chat-shell";
 
 type ChatPageProps = {
-  params: {
+  params:
+    | {
+        chatId: string;
+      }
+    | Promise<{
     chatId: string;
-  };
+      }>;
 };
 
-export default function ChatPage({ params }: ChatPageProps) {
-  const parsed = Number(params.chatId);
+export default async function ChatPage({ params }: ChatPageProps) {
+  const resolvedParams = await Promise.resolve(params);
+  const parsed = Number(resolvedParams.chatId);
   const chatId = Number.isFinite(parsed) ? parsed : undefined;
 
   return <ChatShell activeChatId={chatId} />;

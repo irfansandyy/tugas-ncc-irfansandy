@@ -132,6 +132,71 @@ func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ChatHandler) SendMessageStream(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "missing user context")
+		return
+	}
+
+	chatID, err := parseChatID(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid chat id")
+		return
+	}
+
+	var req sendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeSSE := func(event string, payload any) error {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte("event: " + event + "\n")); err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte("data: " + string(data) + "\n\n")); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	userMsg, assistantMsg, streamErr := h.chatService.SendMessageStream(
+		r.Context(),
+		userID,
+		chatID,
+		req.Content,
+		func(delta string) error {
+			return writeSSE("token", map[string]string{"delta": delta})
+		},
+	)
+	if streamErr != nil {
+		_ = writeSSE("error", map[string]string{"error": streamErr.Error()})
+		return
+	}
+
+	_ = writeSSE("done", map[string]any{
+		"user_message":      userMsg,
+		"assistant_message": assistantMsg,
+	})
+}
+
 func parseChatID(r *http.Request) (int64, error) {
 	chatIDRaw := chi.URLParam(r, "chatID")
 	return strconv.ParseInt(chatIDRaw, 10, 64)

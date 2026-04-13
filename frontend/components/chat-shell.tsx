@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { APIError, apiFetch } from "@/lib/api";
+import { API_BASE_URL, APIError, apiFetch } from "@/lib/api";
 import { clearSession, getEmail, getToken } from "@/lib/auth";
 
 type Chat = {
@@ -131,6 +131,123 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
     return response;
   }
 
+  async function streamMessage(
+    chatId: number,
+    content: string,
+    onDelta: (delta: string) => void
+  ): Promise<SendMessageResponse> {
+    if (!token) {
+      throw new APIError("missing token", 401);
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/chats/${chatId}/messages/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ content })
+    });
+
+    if (!response.ok) {
+      let message = `Request failed with status ${response.status}`;
+      try {
+        const payload = (await response.json()) as { error?: string };
+        if (payload.error) {
+          message = payload.error;
+        }
+      } catch {
+        // keep fallback message
+      }
+      throw new APIError(message, response.status);
+    }
+
+    if (!response.body) {
+      throw new APIError("streaming response body is empty", 500);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let donePayload: SendMessageResponse | null = null;
+
+    const processEventBlock = (block: string) => {
+      const lines = block.split("\n");
+      let event = "message";
+      const dataLines: string[] = [];
+
+      for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (line.startsWith("event:")) {
+          event = line.slice("event:".length).trim();
+          continue;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice("data:".length).trim());
+        }
+      }
+
+      if (dataLines.length === 0) {
+        return;
+      }
+
+      const dataRaw = dataLines.join("\n");
+      if (event === "token") {
+        try {
+          const payload = JSON.parse(dataRaw) as { delta?: string };
+          if (payload.delta) {
+            onDelta(payload.delta);
+          }
+        } catch {
+          // ignore malformed chunk
+        }
+        return;
+      }
+
+      if (event === "error") {
+        try {
+          const payload = JSON.parse(dataRaw) as { error?: string };
+          throw new APIError(payload.error ?? "streaming failed", 500);
+        } catch (err) {
+          if (err instanceof APIError) {
+            throw err;
+          }
+          throw new APIError("streaming failed", 500);
+        }
+      }
+
+      if (event === "done") {
+        donePayload = JSON.parse(dataRaw) as SendMessageResponse;
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+
+      let splitIndex = buffer.indexOf("\n\n");
+      while (splitIndex >= 0) {
+        const block = buffer.slice(0, splitIndex);
+        buffer = buffer.slice(splitIndex + 2);
+        processEventBlock(block);
+        splitIndex = buffer.indexOf("\n\n");
+      }
+
+      if (done) {
+        if (buffer.trim().length > 0) {
+          processEventBlock(buffer);
+        }
+        break;
+      }
+    }
+
+    if (!donePayload) {
+      throw new APIError("stream ended without final payload", 500);
+    }
+
+    return donePayload;
+  }
+
   async function handleNewChat() {
     if (!token) {
       handleUnauthorized();
@@ -161,6 +278,15 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
     setSending(true);
     setError(null);
 
+    const optimisticUserId = -Date.now();
+    const optimisticAssistantId = optimisticUserId - 1;
+    const nowIso = new Date().toISOString();
+    setMessages((prev) => [
+      ...prev,
+      { id: optimisticUserId, role: "user", content: prompt, created_at: nowIso },
+      { id: optimisticAssistantId, role: "assistant", content: "", created_at: nowIso }
+    ]);
+
     try {
       let chatId = activeChatId;
       if (!chatId) {
@@ -169,16 +295,22 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
         router.push(`/chat/${chatId}`);
       }
 
-      const response = await apiFetch<SendMessageResponse>(
-        `/api/chats/${chatId}/messages`,
-        {
-          method: "POST",
-          body: JSON.stringify({ content: prompt })
-        },
-        token
-      );
+      let streamedText = "";
+      const response = await streamMessage(chatId, prompt, (delta) => {
+        streamedText += delta;
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === optimisticAssistantId ? { ...msg, content: streamedText } : msg
+          )
+        );
+      });
 
-      setMessages((prev) => [...prev, response.user_message, response.assistant_message]);
+      setMessages((prev) => {
+        const withoutOptimistic = prev.filter(
+          (msg) => msg.id !== optimisticUserId && msg.id !== optimisticAssistantId
+        );
+        return [...withoutOptimistic, response.user_message, response.assistant_message];
+      });
       await loadChats();
     } catch (err) {
       const apiError = err as APIError;
@@ -186,6 +318,9 @@ export default function ChatShell({ activeChatId }: ChatShellProps) {
         handleUnauthorized();
         return;
       }
+      setMessages((prev) =>
+        prev.filter((msg) => msg.id !== optimisticUserId && msg.id !== optimisticAssistantId)
+      );
       setError(apiError.message);
     } finally {
       setSending(false);

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -71,6 +72,18 @@ type chatMessage struct {
 type chatCompletionResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
+	} `json:"choices"`
+}
+
+type chatCompletionStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		Text    string `json:"text"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 }
 
@@ -356,6 +369,174 @@ func (s *LLMService) GenerateReply(ctx context.Context, history []models.Message
 	}
 
 	return "", fmt.Errorf("llm request failed: no reachable endpoint; completion fallback error: %w", fallbackErr)
+}
+
+func (s *LLMService) GenerateReplyStream(
+	ctx context.Context,
+	history []models.Message,
+	userPrompt string,
+	onToken func(string) error,
+) (string, error) {
+	requestMessages := []chatMessage{
+		{
+			Role: "system",
+			Content: "You are a concise, helpful assistant. " +
+				"Keep answers practical and grounded.",
+		},
+	}
+
+	for _, msg := range history {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		requestMessages = append(requestMessages, chatMessage{Role: msg.Role, Content: msg.Content})
+	}
+
+	shouldAppendPrompt := true
+	if len(history) > 0 {
+		last := history[len(history)-1]
+		if last.Role == "user" && strings.TrimSpace(last.Content) == strings.TrimSpace(userPrompt) {
+			shouldAppendPrompt = false
+		}
+	}
+
+	if shouldAppendPrompt {
+		requestMessages = append(requestMessages, chatMessage{Role: "user", Content: userPrompt})
+	}
+
+	requestMessages = limitMessagesByContext(requestMessages, s.ctxSize)
+
+	payload := chatCompletionRequest{
+		Model:       s.model,
+		Messages:    requestMessages,
+		Temperature: 0.7,
+		Stream:      true,
+		MaxTokens:   512,
+		TopP:        0.9,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for _, apiBase := range s.apiBaseCandidates() {
+		for _, endpoint := range openAIEndpointCandidates(apiBase, "/chat/completions") {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if reqErr != nil {
+				lastErr = reqErr
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, doErr := s.client.Do(req)
+			if doErr != nil {
+				lastErr = fmt.Errorf("llm stream failed via %s: %w", endpoint, doErr)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusNotFound {
+				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				lastErr = fmt.Errorf("llm stream endpoint not found at %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+				continue
+			}
+
+			if resp.StatusCode >= http.StatusBadRequest {
+				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				return "", fmt.Errorf("llm stream failed via %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+			}
+
+			reply, streamErr := consumeChatCompletionStream(resp.Body, onToken)
+			resp.Body.Close()
+			if streamErr != nil {
+				lastErr = streamErr
+				continue
+			}
+
+			if strings.TrimSpace(reply) != "" {
+				return strings.TrimSpace(reply), nil
+			}
+			lastErr = errors.New("llm stream returned empty reply")
+		}
+	}
+
+	fallbackReply, fallbackErr := s.GenerateReply(ctx, history, userPrompt)
+	if fallbackErr != nil {
+		if lastErr != nil {
+			return "", fmt.Errorf("%v; fallback error: %w", lastErr, fallbackErr)
+		}
+		return "", fallbackErr
+	}
+
+	if onToken != nil {
+		for _, piece := range strings.SplitAfter(fallbackReply, " ") {
+			if piece == "" {
+				continue
+			}
+			if err := onToken(piece); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	return fallbackReply, nil
+}
+
+func consumeChatCompletionStream(body io.Reader, onToken func(string) error) (string, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	var builder strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk chatCompletionStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		delta := ""
+		if len(chunk.Choices) > 0 {
+			delta = chunk.Choices[0].Delta.Content
+			if delta == "" {
+				delta = chunk.Choices[0].Text
+			}
+			if delta == "" {
+				delta = chunk.Choices[0].Message.Content
+			}
+		}
+
+		if delta == "" {
+			continue
+		}
+
+		builder.WriteString(delta)
+		if onToken != nil {
+			if err := onToken(delta); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+
+	return builder.String(), nil
 }
 
 func limitMessagesByContext(messages []chatMessage, ctxSize int) []chatMessage {
