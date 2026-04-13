@@ -74,6 +74,24 @@ type chatCompletionResponse struct {
 	} `json:"choices"`
 }
 
+type completionRequest struct {
+	Model       string  `json:"model,omitempty"`
+	Prompt      string  `json:"prompt"`
+	NPredict    int     `json:"n_predict,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
+	Temperature float64 `json:"temperature,omitempty"`
+	TopP        float64 `json:"top_p,omitempty"`
+	Stream      bool    `json:"stream"`
+}
+
+type completionResponse struct {
+	Content string `json:"content"`
+	Choices []struct {
+		Text    string      `json:"text"`
+		Message chatMessage `json:"message"`
+	} `json:"choices"`
+}
+
 func (s *LLMService) apiBaseCandidates() []string {
 	base := strings.TrimSuffix(s.baseURL, "/")
 	candidates := []string{base}
@@ -132,6 +150,108 @@ func openAIEndpointCandidates(apiBase, suffix string) []string {
 	}
 
 	return unique
+}
+
+func messagesToPrompt(messages []chatMessage) string {
+	var b strings.Builder
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			b.WriteString("System: ")
+		case "assistant":
+			b.WriteString("Assistant: ")
+		default:
+			b.WriteString("User: ")
+		}
+		b.WriteString(msg.Content)
+		b.WriteString("\n")
+	}
+	b.WriteString("Assistant:")
+	return b.String()
+}
+
+func parseCompletionText(respBody []byte) (string, error) {
+	var completion completionResponse
+	if err := json.Unmarshal(respBody, &completion); err != nil {
+		return "", err
+	}
+
+	if text := strings.TrimSpace(completion.Content); text != "" {
+		return text, nil
+	}
+
+	if len(completion.Choices) > 0 {
+		if text := strings.TrimSpace(completion.Choices[0].Text); text != "" {
+			return text, nil
+		}
+		if text := strings.TrimSpace(completion.Choices[0].Message.Content); text != "" {
+			return text, nil
+		}
+	}
+
+	return "", errors.New("llm completion returned no text")
+}
+
+func (s *LLMService) tryCompletionFallback(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	payload := completionRequest{
+		Model:       s.model,
+		Prompt:      prompt,
+		NPredict:    maxTokens,
+		MaxTokens:   maxTokens,
+		Temperature: 0.7,
+		TopP:        0.9,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for _, apiBase := range s.apiBaseCandidates() {
+		for _, endpoint := range openAIEndpointCandidates(apiBase, "/completion") {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if reqErr != nil {
+				lastErr = reqErr
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, doErr := s.client.Do(req)
+			if doErr != nil {
+				lastErr = fmt.Errorf("llm completion failed via %s: %w", endpoint, doErr)
+				continue
+			}
+
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusNotFound {
+				lastErr = fmt.Errorf("llm completion endpoint not found at %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+				continue
+			}
+
+			if resp.StatusCode >= http.StatusBadRequest {
+				lastErr = fmt.Errorf("llm completion failed via %s: status=%d body=%s", endpoint, resp.StatusCode, string(respBody))
+				continue
+			}
+
+			text, parseErr := parseCompletionText(respBody)
+			if parseErr != nil {
+				lastErr = parseErr
+				continue
+			}
+
+			return text, nil
+		}
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+
+	return "", errors.New("llm completion fallback failed: no reachable endpoint")
 }
 
 func (s *LLMService) GenerateReply(ctx context.Context, history []models.Message, userPrompt string) (string, error) {
@@ -220,10 +340,21 @@ func (s *LLMService) GenerateReply(ctx context.Context, history []models.Message
 	}
 
 	if lastErr != nil {
-		return "", lastErr
+		fallbackPrompt := messagesToPrompt(requestMessages)
+		fallbackReply, fallbackErr := s.tryCompletionFallback(ctx, fallbackPrompt, payload.MaxTokens)
+		if fallbackErr == nil {
+			return fallbackReply, nil
+		}
+		return "", fmt.Errorf("%v; completion fallback error: %w", lastErr, fallbackErr)
 	}
 
-	return "", errors.New("llm request failed: no reachable endpoint")
+	fallbackPrompt := messagesToPrompt(requestMessages)
+	fallbackReply, fallbackErr := s.tryCompletionFallback(ctx, fallbackPrompt, payload.MaxTokens)
+	if fallbackErr == nil {
+		return fallbackReply, nil
+	}
+
+	return "", fmt.Errorf("llm request failed: no reachable endpoint; completion fallback error: %w", fallbackErr)
 }
 
 func limitMessagesByContext(messages []chatMessage, ctxSize int) []chatMessage {
@@ -319,7 +450,19 @@ func (s *LLMService) HealthCheck(ctx context.Context) error {
 	}
 
 	if lastErr != nil {
-		return lastErr
+		probeCtx, probeCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer probeCancel()
+		if _, probeErr := s.tryCompletionFallback(probeCtx, "User: ping\nAssistant:", 1); probeErr == nil {
+			return nil
+		} else {
+			return fmt.Errorf("%v; completion probe error: %w", lastErr, probeErr)
+		}
+	}
+
+	probeCtx, probeCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer probeCancel()
+	if _, probeErr := s.tryCompletionFallback(probeCtx, "User: ping\nAssistant:", 1); probeErr == nil {
+		return nil
 	}
 
 	return errors.New("llm health failed: no reachable endpoint")
