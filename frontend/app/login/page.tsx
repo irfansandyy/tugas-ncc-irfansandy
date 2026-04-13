@@ -11,6 +11,7 @@ type LoginResponse = {
   user: {
     id: number;
     email: string;
+    username: string;
   };
 };
 
@@ -31,7 +32,7 @@ export default function LoginPage() {
         method: "POST",
         body: JSON.stringify({ email, password })
       });
-      setSession(response.token, response.user.email);
+      setSession(response.token, response.user.email, response.user.username);
       router.replace("/chat");
     } catch (err) {
       const apiError = err as APIError;

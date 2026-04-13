@@ -8,6 +8,7 @@ import { APIError, apiFetch } from "@/lib/api";
 export default function RegisterPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -18,9 +19,9 @@ export default function RegisterPage() {
     setLoading(true);
 
     try {
-      await apiFetch<{ id: number; email: string }>("/api/auth/register", {
+      await apiFetch<{ id: number; email: string; username: string }>("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify({ email, password })
+        body: JSON.stringify({ email, username, password })
       });
       router.replace("/login");
     } catch (err) {
@@ -44,6 +45,15 @@ export default function RegisterPage() {
             placeholder="Email"
             value={email}
             onChange={(event) => setEmail(event.target.value)}
+          />
+          <input
+            className="input"
+            type="text"
+            minLength={2}
+            maxLength={32}
+            placeholder="Username (optional)"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
           />
           <input
             className="input"

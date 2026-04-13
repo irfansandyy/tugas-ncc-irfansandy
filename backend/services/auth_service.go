@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"app-backend/models"
@@ -36,11 +37,20 @@ func NewAuthService(userRepo repositories.UserRepository, jwtSecret string, toke
 	}
 }
 
-func (s *AuthService) Register(ctx context.Context, email, password string) (models.User, error) {
+func (s *AuthService) Register(ctx context.Context, email, password, username string) (models.User, error) {
 	if _, err := s.userRepo.GetByEmail(ctx, email); err == nil {
 		return models.User{}, ErrEmailInUse
 	} else if !errors.Is(err, repositories.ErrUserNotFound) {
 		return models.User{}, err
+	}
+
+	username = strings.TrimSpace(username)
+	if username == "" {
+		parts := strings.SplitN(email, "@", 2)
+		username = strings.TrimSpace(parts[0])
+	}
+	if username == "" {
+		username = "user"
 	}
 
 	hashBytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -48,7 +58,7 @@ func (s *AuthService) Register(ctx context.Context, email, password string) (mod
 		return models.User{}, err
 	}
 
-	return s.userRepo.CreateUser(ctx, email, string(hashBytes))
+	return s.userRepo.CreateUser(ctx, email, string(hashBytes), username)
 }
 
 func (s *AuthService) Login(ctx context.Context, email, password string) (string, models.User, error) {
@@ -102,4 +112,17 @@ func (s *AuthService) createJWT(userID int64) (string, error) {
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(s.jwtSecret)
+}
+
+func (s *AuthService) GetProfile(ctx context.Context, userID int64) (models.User, error) {
+	return s.userRepo.GetByID(ctx, userID)
+}
+
+func (s *AuthService) UpdateUsername(ctx context.Context, userID int64, username string) (models.User, error) {
+	username = strings.TrimSpace(username)
+	if len(username) < 2 || len(username) > 32 {
+		return models.User{}, errors.New("username must be between 2 and 32 characters")
+	}
+
+	return s.userRepo.UpdateUsername(ctx, userID, username)
 }

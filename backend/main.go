@@ -45,6 +45,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	if _, err := db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`); err != nil {
+		logger.Error("failed to ensure users.username", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE chats ADD COLUMN IF NOT EXISTS slug TEXT`); err != nil {
+		logger.Error("failed to ensure chats.slug", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_slug_unique ON chats(slug)`); err != nil {
+		logger.Error("failed to ensure chats.slug index", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
 	userRepo := repositories.NewPostgresUserRepository(db)
 	chatRepo := repositories.NewPostgresChatRepository(db)
 
@@ -80,6 +93,8 @@ func main() {
 
 		api.Group(func(protected chi.Router) {
 			protected.Use(middleware.JWTAuth(authService))
+			protected.Get("/me", authHandler.Me)
+			protected.Patch("/me", authHandler.UpdateUsername)
 			protected.Get("/chats", chatHandler.ListChats)
 			protected.Post("/chats", chatHandler.CreateChat)
 			protected.Get("/chats/{chatSlug}/messages", chatHandler.ListMessages)

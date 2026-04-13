@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE_URL, APIError, apiFetch } from "@/lib/api";
-import { clearSession, getEmail, getToken } from "@/lib/auth";
+import { clearSession, getEmail, getToken, getUsername, setUsername } from "@/lib/auth";
 
 type Chat = {
   id: number;
@@ -35,6 +35,12 @@ type MessagesResponse = {
 type SendMessageResponse = {
   user_message: Message;
   assistant_message: Message;
+};
+
+type ProfileResponse = {
+  id: number;
+  email: string;
+  username: string;
 };
 
 const chatsCache: {
@@ -69,9 +75,12 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string>("");
+  const [userName, setUserName] = useState<string>("");
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const messagesBottomRef = useRef<HTMLDivElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const token = useMemo(() => getToken(), []);
   const activeChat = useMemo(
@@ -79,11 +88,14 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
     [activeChatSlug, chats]
   );
   const profileName = useMemo(() => {
+    if (userName.trim()) {
+      return userName.trim();
+    }
     if (!userEmail) {
       return "User";
     }
     return userEmail.split("@")[0] || userEmail;
-  }, [userEmail]);
+  }, [userEmail, userName]);
   const avatar = useMemo(() => {
     return profileName.slice(0, 2).toUpperCase();
   }, [profileName]);
@@ -115,6 +127,26 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
       setError(apiError.message);
     } finally {
       setLoadingChats(false);
+    }
+  }, [handleUnauthorized, token]);
+
+  const loadProfile = useCallback(async () => {
+    if (!token) {
+      return;
+    }
+
+    try {
+      const profile = await apiFetch<ProfileResponse>("/api/me", { method: "GET" }, token);
+      setUserEmail(profile.email);
+      setUserName(profile.username);
+      setUsername(profile.username);
+    } catch (err) {
+      const apiError = err as APIError;
+      if (apiError.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      // Keep locally cached identity values when profile fetch is temporarily unavailable.
     }
   }, [handleUnauthorized, token]);
 
@@ -159,6 +191,8 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
       return;
     }
     setUserEmail(getEmail() ?? "");
+    setUserName(getUsername() ?? "");
+    void loadProfile();
     if (chatsCache.items.length > 0) {
       setChats(chatsCache.items);
       setLoadingChats(false);
@@ -166,7 +200,7 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
       return;
     }
     void loadChats(true);
-  }, [handleUnauthorized, loadChats, token]);
+  }, [handleUnauthorized, loadChats, loadProfile, token]);
 
   useEffect(() => {
     if (!activeChatSlug) {
@@ -213,7 +247,8 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
   async function streamMessage(
     chatSlug: string,
     content: string,
-    onDelta: (delta: string) => void
+    onDelta: (delta: string) => void,
+    signal: AbortSignal
   ): Promise<SendMessageResponse> {
     if (!token) {
       throw new APIError("missing token", 401);
@@ -225,6 +260,7 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`
       },
+      signal,
       body: JSON.stringify({ content })
     });
 
@@ -303,6 +339,7 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
     while (true) {
       const { value, done } = await reader.read();
       buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      buffer = buffer.replace(/\r\n/g, "\n");
 
       let splitIndex = buffer.indexOf("\n\n");
       while (splitIndex >= 0) {
@@ -360,6 +397,12 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
     const optimisticUserId = -Date.now();
     const optimisticAssistantId = optimisticUserId - 1;
     const nowIso = new Date().toISOString();
+    let chatSlug = activeChatSlug;
+    let streamedText = "";
+    const streamAbort = new AbortController();
+    streamAbortRef.current = streamAbort;
+    stopRequestedRef.current = false;
+
     setMessages((prev) => [
       ...prev,
       { id: optimisticUserId, role: "user", content: prompt, created_at: nowIso },
@@ -367,14 +410,12 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
     ]);
 
     try {
-      let chatSlug = activeChatSlug;
       if (!chatSlug) {
         const created = await createChat(prompt.slice(0, 42));
         chatSlug = created.slug;
         router.push(`/chat/${chatSlug}`);
       }
 
-      let streamedText = "";
       const response = await streamMessage(chatSlug, prompt, (delta) => {
         streamedText += delta;
         setMessages((prev) =>
@@ -382,7 +423,7 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
             msg.id === optimisticAssistantId ? { ...msg, content: streamedText } : msg
           )
         );
-      });
+      }, streamAbort.signal);
 
       setMessages((prev) => {
         const withoutOptimistic = prev.filter(
@@ -396,6 +437,25 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
       });
       await loadChats(false);
     } catch (err) {
+      const possibleAbort = err as { name?: string };
+      const isAbort = possibleAbort.name === "AbortError" || stopRequestedRef.current;
+      if (isAbort) {
+        setError(null);
+        setMessages((prev) => {
+          const stopped = prev.map((msg) =>
+            msg.id === optimisticAssistantId
+              ? { ...msg, content: streamedText.trim() ? streamedText : "Stopped." }
+              : msg
+          );
+          if (chatSlug) {
+            messagesCache[chatSlug] = stopped;
+          }
+          return stopped;
+        });
+        await loadChats(false);
+        return;
+      }
+
       const apiError = err as APIError;
       if (apiError.status === 401) {
         handleUnauthorized();
@@ -407,7 +467,17 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
       setError(apiError.message);
     } finally {
       setSending(false);
+      streamAbortRef.current = null;
+      stopRequestedRef.current = false;
     }
+  }
+
+  function stopStreaming() {
+    if (!sending) {
+      return;
+    }
+    stopRequestedRef.current = true;
+    streamAbortRef.current?.abort();
   }
 
   function logout() {
@@ -462,6 +532,9 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
             {menuOpen ? (
               <div className="profile-dropdown" role="menu">
                 <p className="profile-email">{userEmail || "No email found"}</p>
+                <Link href="/settings" className="menu-link" onClick={() => setMenuOpen(false)}>
+                  Profile Settings
+                </Link>
                 <button className="button button-ghost chat-logout" type="button" onClick={logout}>
                   Logout
                 </button>
@@ -494,9 +567,17 @@ export default function ChatShell({ activeChatSlug }: ChatShellProps) {
               placeholder="Type your message..."
               disabled={sending}
             />
-            <button className="button" type="submit" disabled={sending}>
-              {sending ? "Sending..." : "Send"}
-            </button>
+            <div className="composer-actions">
+              {sending ? <span className="loading-ring" aria-hidden="true" /> : null}
+              <button
+                className={`button ${sending ? "button-stop" : ""}`}
+                type={sending ? "button" : "submit"}
+                onClick={sending ? stopStreaming : undefined}
+                disabled={!sending && !draft.trim()}
+              >
+                {sending ? "Stop" : "Send"}
+              </button>
+            </div>
           </div>
         </form>
       </main>
