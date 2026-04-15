@@ -25,7 +25,7 @@ type Config struct {
 
 func Load() Config {
 	return Config{
-		AppPort:                getEnv("APP_PORT", "8080"),
+		AppPort:                getEnv("APP_PORT", "8000"),
 		DatabaseURL:            getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/chatdb?sslmode=disable"),
 		JWTSecret:              getEnv("JWT_SECRET", "change-me-in-production"),
 		TokenTTL:               time.Duration(getEnvInt("JWT_TTL_MINUTES", 60*24)) * time.Minute,
